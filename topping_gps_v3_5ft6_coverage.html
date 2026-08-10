@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Topping GPS Coverage</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+  #map { height: calc(100% - 76px); background:#ddd; }
+  #bar {
+    height: 76px; box-sizing: border-box; padding: 7px;
+    display: grid; grid-template-columns: repeat(4,1fr); gap: 6px;
+    background: #f4f4f4; border-top: 1px solid #bbb;
+  }
+  button {
+    font-size: 16px; font-weight: 700; border: 1px solid #888;
+    border-radius: 8px; background: white; color:black;
+    touch-action: manipulation;
+  }
+  button.active { background:#222; color:white; }
+  #status {
+    position:absolute; z-index:1000; top:10px; left:50%;
+    transform:translateX(-50%); background:rgba(255,255,255,.92);
+    padding:7px 10px; border-radius:8px; font-size:14px;
+    box-shadow:0 1px 4px rgba(0,0,0,.3); white-space:nowrap;
+  }
+  #accuracy {
+    position:absolute; z-index:1000; top:50px; left:10px;
+    background:rgba(255,255,255,.9); padding:5px 8px;
+    border-radius:6px; font-size:13px;
+  }
+  @media (max-width:600px) {
+    button { font-size:13px; }
+  }
+</style>
+</head>
+<body>
+<div id="status">GPS ready</div>
+<div id="accuracy">Accuracy: --</div>
+<div id="map"></div>
+
+<div id="bar">
+  <button id="startBtn">START</button>
+  <button id="pauseBtn">PAUSE</button>
+  <button id="boundaryBtn">BOUNDARY</button>
+  <button id="saveBtn">SAVE</button>
+  <button id="centreBtn">CENTRE</button>
+  <button id="undoBtn">UNDO</button>
+  <button id="clearBtn">CLEAR</button>
+  <button id="exportBtn">EXPORT</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const MOWER_WIDTH_METRES = 1.6764; // 5 ft 6 in
+const HALF_WIDTH = MOWER_WIDTH_METRES / 2;
+
+const map = L.map('map', {zoomControl:true}).setView([52.68, -7.81], 15);
+
+const satellite = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  {maxZoom:20, attribution:'Tiles &copy; Esri'}
+).addTo(map);
+
+const roads = L.tileLayer(
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom:20, attribution:'&copy; OpenStreetMap contributors'}
+);
+
+L.control.layers({'Satellite':satellite,'Road map':roads}, null, {
+  position:'topright', collapsed:true
+}).addTo(map);
+
+let watchId = null;
+let tracking = false;
+let paused = false;
+let boundaryMode = false;
+let firstFix = true;
+
+let currentMarker = null;
+let accuracyCircle = null;
+
+let trackPoints = [];
+let boundaryPoints = [];
+let swathSegments = [];
+
+const trackLine = L.polyline([], {weight:3, opacity:0.9}).addTo(map);
+const boundaryLine = L.polygon([], {weight:3, fillOpacity:0.08}).addTo(map);
+const swathLayer = L.layerGroup().addTo(map);
+
+const statusEl = document.getElementById('status');
+const accuracyEl = document.getElementById('accuracy');
+const startBtn = document.getElementById('startBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const boundaryBtn = document.getElementById('boundaryBtn');
+
+function setStatus(t){ statusEl.textContent = t; }
+
+function destinationPoint(lat, lng, bearingDeg, distanceM) {
+  const R = 6378137;
+  const brng = bearingDeg * Math.PI/180;
+  const lat1 = lat * Math.PI/180;
+  const lon1 = lng * Math.PI/180;
+  const dr = distanceM / R;
+
+  const lat2 = Math.asin(
+    Math.sin(lat1)*Math.cos(dr) +
+    Math.cos(lat1)*Math.sin(dr)*Math.cos(brng)
+  );
+  const lon2 = lon1 + Math.atan2(
+    Math.sin(brng)*Math.sin(dr)*Math.cos(lat1),
+    Math.cos(dr)-Math.sin(lat1)*Math.sin(lat2)
+  );
+  return [lat2*180/Math.PI, lon2*180/Math.PI];
+}
+
+function bearingBetween(a, b) {
+  const lat1 = a[0]*Math.PI/180, lat2 = b[0]*Math.PI/180;
+  const dLon = (b[1]-a[1])*Math.PI/180;
+  const y = Math.sin(dLon)*Math.cos(lat2);
+  const x = Math.cos(lat1)*Math.sin(lat2) -
+            Math.sin(lat1)*Math.cos(lat2)*Math.cos(dLon);
+  return (Math.atan2(y,x)*180/Math.PI + 360) % 360;
+}
+
+function makeSwathSegment(a, b) {
+  const bearing = bearingBetween(a,b);
+  const leftBearing = (bearing + 270) % 360;
+  const rightBearing = (bearing + 90) % 360;
+
+  const aL = destinationPoint(a[0],a[1],leftBearing,HALF_WIDTH);
+  const aR = destinationPoint(a[0],a[1],rightBearing,HALF_WIDTH);
+  const bL = destinationPoint(b[0],b[1],leftBearing,HALF_WIDTH);
+  const bR = destinationPoint(b[0],b[1],rightBearing,HALF_WIDTH);
+
+  return [aL,bL,bR,aR];
+}
+
+function drawAllSwaths() {
+  swathLayer.clearLayers();
+  swathSegments = [];
+  for (let i=1; i<trackPoints.length; i++) {
+    const poly = makeSwathSegment(trackPoints[i-1], trackPoints[i]);
+    swathSegments.push(poly);
+    L.polygon(poly, {
+      stroke:false,
+      fillOpacity:0.35
+    }).addTo(swathLayer);
+  }
+}
+
+function saveLocal(show=true) {
+  try {
+    localStorage.setItem('toppingGPSCoverage', JSON.stringify({
+      trackPoints,
+      boundaryPoints,
+      savedAt:new Date().toISOString()
+    }));
+    if(show) setStatus('Saved on this phone');
+  } catch(e) {
+    if(show) setStatus('Could not save');
+  }
+}
+
+function loadLocal() {
+  try {
+    const raw = localStorage.getItem('toppingGPSCoverage');
+    if(!raw) return;
+    const d = JSON.parse(raw);
+    trackPoints = Array.isArray(d.trackPoints) ? d.trackPoints : [];
+    boundaryPoints = Array.isArray(d.boundaryPoints) ? d.boundaryPoints : [];
+    trackLine.setLatLngs(trackPoints);
+    boundaryLine.setLatLngs(boundaryPoints);
+    drawAllSwaths();
+
+    if(trackPoints.length>1) {
+      map.fitBounds(trackLine.getBounds(), {padding:[25,25]});
+      setStatus('Previous track loaded');
+    } else if(boundaryPoints.length>2) {
+      map.fitBounds(boundaryLine.getBounds(), {padding:[25,25]});
+      setStatus('Previous boundary loaded');
+    }
+  } catch(e) {}
+}
+
+function onPosition(pos) {
+  const lat = pos.coords.latitude;
+  const lng = pos.coords.longitude;
+  const acc = Math.round(pos.coords.accuracy || 0);
+  const ll = [lat,lng];
+
+  accuracyEl.textContent = 'Accuracy: ' + acc + ' m';
+
+  if(!currentMarker) {
+    currentMarker = L.circleMarker(ll, {
+      radius:8, weight:3, fillOpacity:1
+    }).addTo(map);
+    accuracyCircle = L.circle(ll, {
+      radius:acc, weight:1, fillOpacity:0.05
+    }).addTo(map);
+  } else {
+    currentMarker.setLatLng(ll);
+    accuracyCircle.setLatLng(ll).setRadius(acc);
+  }
+
+  if(firstFix) {
+    map.setView(ll,18);
+    firstFix = false;
+  }
+
+  if(tracking && !paused) {
+    const last = trackPoints[trackPoints.length-1];
+    if(!last || map.distance(last,ll)>=2) {
+      trackPoints.push(ll);
+      trackLine.setLatLngs(trackPoints);
+
+      if(trackPoints.length>=2) {
+        const a = trackPoints[trackPoints.length-2];
+        const b = trackPoints[trackPoints.length-1];
+        const poly = makeSwathSegment(a,b);
+        swathSegments.push(poly);
+        L.polygon(poly, {
+          stroke:false,
+          fillOpacity:0.35
+        }).addTo(swathLayer);
+      }
+
+      saveLocal(false);
+    }
+  }
+
+  setStatus(paused ? 'Paused' : (tracking ? 'Tracking topping - 5 ft 6 in' : 'GPS located'));
+}
+
+function onError(err) {
+  setStatus('GPS error: ' + err.message);
+}
+
+function startGps() {
+  if(!navigator.geolocation) {
+    alert('GPS/location is not supported by this browser.');
+    return;
+  }
+  if(watchId===null) {
+    watchId = navigator.geolocation.watchPosition(
+      onPosition, onError,
+      {enableHighAccuracy:true, maximumAge:1000, timeout:15000}
+    );
+  }
+}
+
+startBtn.addEventListener('click', () => {
+  startGps();
+  tracking = true;
+  paused = false;
+  startBtn.classList.add('active');
+  pauseBtn.classList.remove('active');
+  setStatus('Tracking topping - 5 ft 6 in');
+});
+
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  pauseBtn.classList.toggle('active', paused);
+  setStatus(paused ? 'Paused' : (tracking ? 'Tracking topping - 5 ft 6 in' : 'GPS located'));
+});
+
+boundaryBtn.addEventListener('click', () => {
+  boundaryMode = !boundaryMode;
+  boundaryBtn.classList.toggle('active', boundaryMode);
+  setStatus(boundaryMode ? 'Tap map around field boundary' : 'Boundary mode off');
+});
+
+map.on('click', e => {
+  if(!boundaryMode) return;
+  boundaryPoints.push([e.latlng.lat,e.latlng.lng]);
+  boundaryLine.setLatLngs(boundaryPoints);
+  saveLocal(false);
+  setStatus('Boundary point added');
+});
+
+document.getElementById('centreBtn').addEventListener('click', () => {
+  if(currentMarker) map.setView(currentMarker.getLatLng(),18);
+  else setStatus('Waiting for GPS');
+});
+
+document.getElementById('undoBtn').addEventListener('click', () => {
+  if(boundaryMode && boundaryPoints.length) {
+    boundaryPoints.pop();
+    boundaryLine.setLatLngs(boundaryPoints);
+    setStatus('Boundary point removed');
+  } else if(trackPoints.length) {
+    trackPoints.pop();
+    trackLine.setLatLngs(trackPoints);
+    drawAllSwaths();
+    setStatus('Last track point removed');
+  }
+  saveLocal(false);
+});
+
+document.getElementById('saveBtn').addEventListener('click', () => saveLocal(true));
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  if(!confirm('Clear the saved topping track and boundary?')) return;
+
+  trackPoints = [];
+  boundaryPoints = [];
+  swathSegments = [];
+
+  trackLine.setLatLngs([]);
+  boundaryLine.setLatLngs([]);
+  swathLayer.clearLayers();
+
+  try { localStorage.removeItem('toppingGPSCoverage'); } catch(e) {}
+
+  setStatus('Cleared');
+});
+
+document.getElementById('exportBtn').addEventListener('click', () => {
+  const features = [];
+
+  if(trackPoints.length>0) {
+    features.push({
+      type:'Feature',
+      properties:{
+        name:'Topping track',
+        mower_width_m:MOWER_WIDTH_METRES
+      },
+      geometry:{
+        type:'LineString',
+        coordinates:trackPoints.map(p=>[p[1],p[0]])
+      }
+    });
+  }
+
+  if(boundaryPoints.length>=3) {
+    const closed = boundaryPoints.concat([boundaryPoints[0]]);
+    features.push({
+      type:'Feature',
+      properties:{name:'Field boundary'},
+      geometry:{
+        type:'Polygon',
+        coordinates:[closed.map(p=>[p[1],p[0]])]
+      }
+    });
+  }
+
+  const geo = {type:'FeatureCollection',features};
+  const blob = new Blob([JSON.stringify(geo,null,2)], {
+    type:'application/geo+json'
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'topping-field-coverage.geojson';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+
+loadLocal();
+startGps();
+</script>
+</body>
+</html>
