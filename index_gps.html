@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Topping GPS</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+  #map { height: calc(100% - 76px); }
+  #bar {
+    height: 76px; box-sizing: border-box; padding: 7px;
+    display: grid; grid-template-columns: repeat(4,1fr); gap: 6px;
+    background: #f4f4f4; border-top: 1px solid #bbb;
+  }
+  button {
+    font-size: 16px; font-weight: 700; border: 1px solid #888;
+    border-radius: 8px; background: white;
+  }
+  button.active { background: #222; color: white; }
+  #status {
+    position: absolute; z-index: 1000; top: 10px; left: 50%;
+    transform: translateX(-50%); background: rgba(255,255,255,.92);
+    padding: 7px 10px; border-radius: 8px; font-size: 14px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.3);
+  }
+  #accuracy {
+    position: absolute; z-index: 1000; top: 50px; left: 10px;
+    background: rgba(255,255,255,.9); padding: 5px 8px;
+    border-radius: 6px; font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div id="status">GPS ready</div>
+<div id="accuracy">Accuracy: --</div>
+<div id="map"></div>
+<div id="bar">
+  <button id="startBtn">START</button>
+  <button id="pauseBtn">PAUSE</button>
+  <button id="boundaryBtn">BOUNDARY</button>
+  <button id="saveBtn">SAVE</button>
+  <button id="centreBtn">CENTRE</button>
+  <button id="undoBtn">UNDO</button>
+  <button id="clearBtn">CLEAR</button>
+  <button id="exportBtn">EXPORT</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map', {zoomControl:true}).setView([52.68, -7.81], 15);
+
+const satellite = L.tileLayer(
+  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom: 20, attribution:'© OpenStreetMap contributors'}
+).addTo(map);
+
+let watchId = null;
+let tracking = false;
+let paused = false;
+let boundaryMode = false;
+let firstFix = true;
+let currentMarker = null;
+let accuracyCircle = null;
+let trackPoints = [];
+let boundaryPoints = [];
+
+const trackLine = L.polyline([], {weight: 6}).addTo(map);
+const boundaryLine = L.polygon([], {weight: 3, fillOpacity: 0.08}).addTo(map);
+
+const statusEl = document.getElementById('status');
+const accuracyEl = document.getElementById('accuracy');
+const startBtn = document.getElementById('startBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const boundaryBtn = document.getElementById('boundaryBtn');
+
+function setStatus(t){ statusEl.textContent = t; }
+
+function saveLocal(){
+  localStorage.setItem('toppingGPS', JSON.stringify({
+    trackPoints, boundaryPoints, savedAt: new Date().toISOString()
+  }));
+  setStatus('Saved on this phone');
+}
+
+function loadLocal(){
+  try {
+    const d = JSON.parse(localStorage.getItem('toppingGPS'));
+    if (!d) return;
+    trackPoints = d.trackPoints || [];
+    boundaryPoints = d.boundaryPoints || [];
+    trackLine.setLatLngs(trackPoints);
+    boundaryLine.setLatLngs(boundaryPoints);
+    if (trackPoints.length) map.fitBounds(trackLine.getBounds(), {padding:[25,25]});
+    else if (boundaryPoints.length) map.fitBounds(boundaryLine.getBounds(), {padding:[25,25]});
+    setStatus('Previous field loaded');
+  } catch(e){}
+}
+loadLocal();
+
+function onPosition(pos){
+  const lat = pos.coords.latitude;
+  const lng = pos.coords.longitude;
+  const acc = Math.round(pos.coords.accuracy || 0);
+  const ll = [lat, lng];
+
+  accuracyEl.textContent = 'Accuracy: ' + acc + ' m';
+
+  if (!currentMarker) {
+    currentMarker = L.circleMarker(ll, {
+      radius:8, weight:3, fillOpacity:1
+    }).addTo(map);
+    accuracyCircle = L.circle(ll, {
+      radius: acc, weight:1, fillOpacity:.05
+    }).addTo(map);
+  } else {
+    currentMarker.setLatLng(ll);
+    accuracyCircle.setLatLng(ll).setRadius(acc);
+  }
+
+  if (firstFix) {
+    map.setView(ll, 18);
+    firstFix = false;
+  }
+
+  if (tracking && !paused) {
+    const last = trackPoints[trackPoints.length - 1];
+    if (!last || map.distance(last, ll) >= 2) {
+      trackPoints.push(ll);
+      trackLine.setLatLngs(trackPoints);
+      localStorage.setItem('toppingGPS', JSON.stringify({trackPoints, boundaryPoints}));
+    }
+  }
+
+  setStatus(paused ? 'Paused' : (tracking ? 'Tracking topping' : 'GPS located'));
+}
+
+function onError(err){
+  setStatus('GPS error: ' + err.message);
+}
+
+function startGps(){
+  if (!navigator.geolocation) {
+    alert('GPS/geolocation is not supported by this browser.');
+    return;
+  }
+  if (watchId === null) {
+    watchId = navigator.geolocation.watchPosition(
+      onPosition, onError,
+      {enableHighAccuracy:true, maximumAge:1000, timeout:15000}
+    );
+  }
+}
+
+startBtn.onclick = () => {
+  startGps();
+  tracking = true;
+  paused = false;
+  startBtn.classList.add('active');
+  pauseBtn.classList.remove('active');
+  setStatus('Tracking topping');
+};
+
+pauseBtn.onclick = () => {
+  paused = !paused;
+  pauseBtn.classList.toggle('active', paused);
+  setStatus(paused ? 'Paused' : 'Tracking topping');
+};
+
+boundaryBtn.onclick = () => {
+  boundaryMode = !boundaryMode;
+  boundaryBtn.classList.toggle('active', boundaryMode);
+  setStatus(boundaryMode ? 'Tap map around field boundary' : 'Boundary mode off');
+};
+
+map.on('click', e => {
+  if (!boundaryMode) return;
+  boundaryPoints.push([e.latlng.lat, e.latlng.lng]);
+  boundaryLine.setLatLngs(boundaryPoints);
+  saveLocal();
+});
+
+document.getElementById('centreBtn').onclick = () => {
+  if (currentMarker) map.setView(currentMarker.getLatLng(), 18);
+};
+
+document.getElementById('undoBtn').onclick = () => {
+  if (boundaryMode && boundaryPoints.length) {
+    boundaryPoints.pop();
+    boundaryLine.setLatLngs(boundaryPoints);
+  } else if (trackPoints.length) {
+    trackPoints.pop();
+    trackLine.setLatLngs(trackPoints);
+  }
+  saveLocal();
+};
+
+document.getElementById('saveBtn').onclick = saveLocal;
+
+document.getElementById('clearBtn').onclick = () => {
+  if (!confirm('Clear the saved topping track and boundary?')) return;
+  trackPoints = [];
+  boundaryPoints = [];
+  trackLine.setLatLngs([]);
+  boundaryLine.setLatLngs([]);
+  localStorage.removeItem('toppingGPS');
+  setStatus('Cleared');
+};
+
+document.getElementById('exportBtn').onclick = () => {
+  const geo = {
+    type:'FeatureCollection',
+    features:[
+      {
+        type:'Feature',
+        properties:{name:'Topping track'},
+        geometry:{type:'LineString', coordinates:trackPoints.map(p => [p[1],p[0]])}
+      },
+      {
+        type:'Feature',
+        properties:{name:'Field boundary'},
+        geometry:{
+          type:'Polygon',
+          coordinates:[boundaryPoints.length
+            ? boundaryPoints.concat([boundaryPoints[0]]).map(p => [p[1],p[0]])
+            : []]
+        }
+      }
+    ]
+  };
+  const blob = new Blob([JSON.stringify(geo,null,2)], {type:'application/geo+json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'topping-field.geojson';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+startGps();
+</script>
+</body>
+</html>
